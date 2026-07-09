@@ -1,0 +1,90 @@
+{
+  "customers": [
+    {
+      "id": "jkgl6ff1g59bdu6w14ae0g",
+      "phone": "+176102265848059@lid",
+      "name": "....!!!♡♡♡",
+      "language": "en",
+      "preferred_time": null,
+      "dietary_prefs": [],
+      "visit_count": 0,
+      "total_spent": 0,
+      "loyalty_points": 0,
+      "notes": null,
+      "created_at": "2026-07-08T08:42:28.435Z",
+      "updated_at": "2026-07-08T08:42:28.435Z"
+    },
+    {
+      "id": "swv77te4f52mmhg50tq6r",
+      "phone": "+176102265848059",
+      "name": "....!!!♡♡♡",
+      "language": "en",
+      "preferred_time": null,
+      "dietary_prefs": [],
+      "visit_count": 0,
+      "total_spent": 0,
+      "loyalty_points": 0,
+      "notes": null,
+      "created_at": "2026-07-08T09:18:33.405Z",
+      "updated_at": "2026-07-08T09:18:33.405Z"
+    }
+  ],
+  "leads": [
+    {
+      "id": "s8xd32y1ybh3vofbd1jzb",
+      "customer_id": "jkgl6ff1g59bdu6w14ae0g",
+      "stage": "new",
+      "source": "whatsapp",
+      "interest": null,
+      "follow_up_at": null,
+      "last_activity": "2026-07-08T08:42:28.435Z",
+      "created_at": "2026-07-08T08:42:28.435Z"
+    },
+    {
+      "id": "2q78wimsi3el8a3adp0uc9",
+      "customer_id": "swv77te4f52mmhg50tq6r",
+      "stage": "new",
+      "source": "whatsapp",
+      "interest": null,
+      "follow_up_at": null,
+      "last_activity": "2026-07-08T09:18:33.405Z",
+      "created_at": "2026-07-08T09:18:33.405Z"
+    }
+  ],
+  "reservations": [],
+  "orders": [],
+  "tickets": [],
+  "messages": [
+    {
+      "id": "u7k472quihof81sdo86ug",
+      "customer_id": "jkgl6ff1g59bdu6w14ae0g",
+      "direction": "inbound",
+      "content": "Hs",
+      "intent": null,
+      "wa_message_id": "false_176102265848059@lid_ACAB83A36CC7EEEF90D153A5B92973DA",
+      "ai_response": null,
+      "created_at": "2026-07-08T08:42:28.436Z"
+    },
+    {
+      "id": "52zfedmo8r6lplox7j2488",
+      "customer_id": "swv77te4f52mmhg50tq6r",
+      "direction": "inbound",
+      "content": "Hi",
+      "intent": null,
+      "wa_message_id": "AC406B0E5634275861DE08FC6EF285E5",
+      "ai_response": null,
+      "created_at": "2026-07-08T09:18:33.406Z"
+    },
+    {
+      "id": "du814ff7mcucqzo7948to",
+      "customer_id": "swv77te4f52mmhg50tq6r",
+      "direction": "inbound",
+      "content": "Yh",
+      "intent": null,
+      "wa_message_id": "AC07FEE06853D129424F871AC79D38D8",
+      "ai_response": null,
+      "created_at": "2026-07-08T09:19:43.438Z"
+    }
+  ],
+  "reminders": []
+}
