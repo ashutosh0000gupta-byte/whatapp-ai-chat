@@ -80,15 +80,16 @@ Response:
 
 /**
  * Call Gemini with conversation history + new message.
- * @param {string}   newMessage  Latest customer message
- * @param {Array}    history     [{ direction, content }] last N messages
- * @param {object}   customer    Customer record from Supabase
+ * @param {string}   systemPrompt System instruction prompt for this business
+ * @param {string}   newMessage   Latest customer message
+ * @param {Array}    history      [{ direction, content }] last N messages
+ * @param {object}   customer     Customer record from Supabase
  * @returns {{ intent, reply, db_action }}
  */
-async function callGemini(newMessage, history = [], customer = {}) {
+async function callGemini(systemPrompt, newMessage, history = [], customer = {}) {
   const model = genAI.getGenerativeModel({
     model: MODEL,
-    systemInstruction: SYSTEM_PROMPT,
+    systemInstruction: systemPrompt || SYSTEM_PROMPT,
   });
 
   // Build context block

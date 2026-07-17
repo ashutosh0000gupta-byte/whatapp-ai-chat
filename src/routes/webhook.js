@@ -2,6 +2,7 @@ const express  = require('express');
 const router   = express.Router();
 const { parseWebhookMessage } = require('../services/whatsapp');
 const { handleIncomingMessage } = require('../handlers/messageHandler');
+const db       = require('../services/supabase');
 require('dotenv').config();
 
 // ── GET /webhook — Meta verification handshake ───────────────
@@ -30,14 +31,28 @@ router.post('/', (req, res) => {
   if (body.object !== 'whatsapp_business_account') return;
 
   const parsed = parseWebhookMessage(body);
-  if (!parsed || !parsed.text && !parsed.buttonReply) {
+  if (!parsed || (!parsed.text && !parsed.buttonReply)) {
     console.log('[Webhook] Non-text message or status update — skipping.');
     return;
   }
 
-  // Process asynchronously (don't block the 200 response)
-  handleIncomingMessage(parsed).catch(err =>
-    console.error('[Webhook] Unhandled error in handleIncomingMessage:', err)
+  // Process asynchronously
+  (async () => {
+    if (!parsed.recipientPhone) {
+      console.warn('[Webhook] Missing recipient display phone number in message payload.');
+      return;
+    }
+    
+    // Look up business by wa_phone_number matching the recipient display phone
+    const business = await db.getBusinessByPhone(parsed.recipientPhone);
+    if (!business) {
+      console.warn(`[Webhook] No registered business found matching phone: ${parsed.recipientPhone}`);
+      return;
+    }
+
+    await handleIncomingMessage(business.id, parsed);
+  })().catch(err =>
+    console.error('[Webhook] Unhandled error in webhook processor:', err)
   );
 });
 

@@ -1,20 +1,44 @@
 const axios = require('axios');
 require('dotenv').config();
 
-const BASE_URL = `https://graph.facebook.com/${process.env.META_API_VERSION || 'v20.0'}/${process.env.META_PHONE_NUMBER_ID}`;
+// Lazily load db to avoid circular dependencies
+let db = null;
+function getDb() {
+  if (!db) db = require('./supabase');
+  return db;
+}
 
-const headers = () => ({
-  Authorization: `Bearer ${process.env.META_ACCESS_TOKEN}`,
-  'Content-Type': 'application/json',
-});
+// ── Helper to resolve credentials per business ────────────────
+async function getCredentials(businessId) {
+  const biz = await getDb().getBusinessById(businessId);
+  if (!biz) throw new Error(`Business not found: ${businessId}`);
+
+  const apiKeys = biz.api_keys || {};
+  const accessToken = apiKeys.meta_access_token || process.env.META_ACCESS_TOKEN;
+  const phoneNumberId = apiKeys.meta_phone_number_id || process.env.META_PHONE_NUMBER_ID;
+  const apiVersion = process.env.META_API_VERSION || 'v20.0';
+
+  if (!accessToken || !phoneNumberId) {
+    throw new Error(`Meta Cloud API credentials missing for business: ${biz.name}`);
+  }
+
+  return {
+    url: `https://graph.facebook.com/${apiVersion}/${phoneNumberId}/messages`,
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+    },
+  };
+}
 
 // ══════════════════════════════════════════════════════════════
 //  SEND TEXT MESSAGE
 // ══════════════════════════════════════════════════════════════
-async function sendMessage(to, text) {
+async function sendMessage(businessId, to, text) {
   try {
+    const { url, headers } = await getCredentials(businessId);
     const { data } = await axios.post(
-      `${BASE_URL}/messages`,
+      url,
       {
         messaging_product: 'whatsapp',
         recipient_type: 'individual',
@@ -22,24 +46,24 @@ async function sendMessage(to, text) {
         type: 'text',
         text: { preview_url: false, body: text },
       },
-      { headers: headers() }
+      { headers }
     );
     return data;
   } catch (err) {
     const detail = err.response?.data || err.message;
-    console.error('[WhatsApp] sendMessage failed:', JSON.stringify(detail, null, 2));
+    console.error(`[WhatsApp - ${businessId}] sendMessage failed:`, JSON.stringify(detail, null, 2));
     throw err;
   }
 }
 
 // ══════════════════════════════════════════════════════════════
-//  SEND INTERACTIVE BUTTONS (up to 3 quick-reply buttons)
+//  SEND INTERACTIVE BUTTONS
 // ══════════════════════════════════════════════════════════════
-async function sendButtons(to, bodyText, buttons) {
-  // buttons: [{ id: 'btn_1', title: 'Confirm' }, ...]
+async function sendButtons(businessId, to, bodyText, buttons) {
   try {
+    const { url, headers } = await getCredentials(businessId);
     const { data } = await axios.post(
-      `${BASE_URL}/messages`,
+      url,
       {
         messaging_product: 'whatsapp',
         to,
@@ -55,23 +79,23 @@ async function sendButtons(to, bodyText, buttons) {
           },
         },
       },
-      { headers: headers() }
+      { headers }
     );
     return data;
   } catch (err) {
-    console.error('[WhatsApp] sendButtons failed:', err.response?.data || err.message);
+    console.error(`[WhatsApp - ${businessId}] sendButtons failed:`, err.response?.data || err.message);
     throw err;
   }
 }
 
 // ══════════════════════════════════════════════════════════════
-//  SEND TEMPLATE (e.g. reservation confirmation)
-//  Template must be pre-approved in Meta Business Manager.
+//  SEND TEMPLATE
 // ══════════════════════════════════════════════════════════════
-async function sendTemplate(to, templateName, languageCode = 'en', components = []) {
+async function sendTemplate(businessId, to, templateName, languageCode = 'en', components = []) {
   try {
+    const { url, headers } = await getCredentials(businessId);
     const { data } = await axios.post(
-      `${BASE_URL}/messages`,
+      url,
       {
         messaging_product: 'whatsapp',
         to,
@@ -82,11 +106,11 @@ async function sendTemplate(to, templateName, languageCode = 'en', components = 
           components,
         },
       },
-      { headers: headers() }
+      { headers }
     );
     return data;
   } catch (err) {
-    console.error('[WhatsApp] sendTemplate failed:', err.response?.data || err.message);
+    console.error(`[WhatsApp - ${businessId}] sendTemplate failed:`, err.response?.data || err.message);
     throw err;
   }
 }
@@ -94,20 +118,20 @@ async function sendTemplate(to, templateName, languageCode = 'en', components = 
 // ══════════════════════════════════════════════════════════════
 //  MARK MESSAGE AS READ
 // ══════════════════════════════════════════════════════════════
-async function markAsRead(messageId) {
+async function markAsRead(businessId, messageId) {
   try {
+    const { url, headers } = await getCredentials(businessId);
     await axios.post(
-      `${BASE_URL}/messages`,
+      url,
       {
         messaging_product: 'whatsapp',
         status: 'read',
         message_id: messageId,
       },
-      { headers: headers() }
+      { headers }
     );
   } catch (err) {
-    // Non-critical — log and continue
-    console.warn('[WhatsApp] markAsRead failed:', err.response?.data || err.message);
+    console.warn(`[WhatsApp - ${businessId}] markAsRead failed:`, err.response?.data || err.message);
   }
 }
 
@@ -124,12 +148,14 @@ function parseWebhookMessage(body) {
 
     const message = value.messages[0];
     const contact = value.contacts?.[0];
+    const recipientPhone = value.metadata?.display_phone_number || null;
 
     return {
-      from:       message.from,                        // phone e.g. "919876543210"
+      recipientPhone,                                      // Business's phone number
+      from:       message.from,                            // Customer's phone number
       name:       contact?.profile?.name || null,
       messageId:  message.id,
-      type:       message.type,                        // text | image | interactive
+      type:       message.type,
       text:       message.text?.body || '',
       buttonReply: message.interactive?.button_reply || null,
       timestamp:  new Date(parseInt(message.timestamp) * 1000).toISOString(),

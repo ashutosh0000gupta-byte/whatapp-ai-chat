@@ -2,16 +2,29 @@
 const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:3000/api';
 
 async function apiFetch(path, options = {}) {
+  const selectedBusinessId = localStorage.getItem('selectedBusinessId') || '';
+  
+  const headers = { 
+    'Content-Type': 'application/json',
+    ...options.headers,
+  };
+
+  // Inject selected business ID header for tenant isolation
+  if (selectedBusinessId) {
+    headers['X-Business-ID'] = selectedBusinessId;
+  }
+
   const res = await fetch(`${API_BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json' },
     ...options,
+    headers,
   });
+  
   if (!res.ok) throw new Error(`API error ${res.status}: ${path}`);
   return res.json();
 }
 
 export const api = {
-  // ── Core ───────────────────────────────────────────────────
+  // ── Core CRM ───────────────────────────────────────────────────
   getStats:        ()             => apiFetch('/stats'),
   getCustomers:    ()             => apiFetch('/customers'),
   getLeads:        ()             => apiFetch('/leads'),
@@ -35,4 +48,12 @@ export const api = {
   // ── AI Preview ───────────────────────────────────────────────
   getAiPreview:    (phone, message, customerId) =>
     apiFetch('/ai-preview', { method: 'POST', body: JSON.stringify({ phone, message, customerId }) }),
+
+  // ── Business Tenants Management ──────────────────────────────
+  getBusinesses:   ()             => apiFetch('/businesses'),
+  getBusiness:     (id)           => apiFetch(`/businesses/${id}`),
+  createBusiness:  (data)         => apiFetch('/businesses', { method: 'POST', body: JSON.stringify(data) }),
+  updateBusiness:  (id, data)     => apiFetch(`/businesses/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
+  deleteBusiness:  (id)           => apiFetch(`/businesses/${id}`, { method: 'DELETE' }),
+  getBusinessQr:   (id)           => apiFetch(`/businesses/${id}/qr`),
 };

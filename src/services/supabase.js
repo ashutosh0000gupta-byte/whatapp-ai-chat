@@ -30,24 +30,106 @@ const supabase = createClient(
 );
 
 // ══════════════════════════════════════════════════════════════
+//  BUSINESS MANAGEMENT
+// ══════════════════════════════════════════════════════════════
+
+async function getAllBusinesses() {
+  const { data, error } = await supabase.from('businesses').select('*').order('name', { ascending: true });
+  if (error) throw new Error(`getAllBusinesses: ${error.message}`);
+  return data || [];
+}
+
+async function getBusinessById(businessId) {
+  const { data, error } = await supabase.from('businesses').select('*').eq('id', businessId).maybeSingle();
+  if (error) throw new Error(`getBusinessById: ${error.message}`);
+  return data;
+}
+
+async function getBusinessByPhone(phone) {
+  const normalized = phone.replace(/^\+/, '').trim();
+  // Find matching business (exact match on wa_phone_number)
+  // We can select all and match in JS to handle leading '+' variations safely
+  const { data, error } = await supabase.from('businesses').select('*');
+  if (error) throw new Error(`getBusinessByPhone: ${error.message}`);
+  return (data || []).find(b => b.wa_phone_number.replace(/^\+/, '').trim() === normalized) || null;
+}
+
+async function createBusiness(fields) {
+  const { data, error } = await supabase.from('businesses').insert(fields).select().single();
+  if (error) throw new Error(`createBusiness: ${error.message}`);
+  return data;
+}
+
+async function updateBusiness(businessId, fields) {
+  const { data, error } = await supabase.from('businesses').update(fields).eq('id', businessId).select().single();
+  if (error) throw new Error(`updateBusiness: ${error.message}`);
+  return data;
+}
+
+async function deleteBusiness(businessId) {
+  const { error } = await supabase.from('businesses').delete().eq('id', businessId);
+  if (error) throw new Error(`deleteBusiness: ${error.message}`);
+  return true;
+}
+
+// ══════════════════════════════════════════════════════════════
+//  WHATSAPP SESSION MANAGEMENT
+// ══════════════════════════════════════════════════════════════
+
+async function getSessionByBusinessId(businessId) {
+  const { data: existing, error: selectError } = await supabase
+    .from('whatsapp_sessions')
+    .select('*')
+    .eq('business_id', businessId)
+    .maybeSingle();
+
+  if (selectError) throw new Error(`getSessionByBusinessId: ${selectError.message}`);
+  if (existing) return existing;
+
+  const { data: created, error: insertError } = await supabase
+    .from('whatsapp_sessions')
+    .insert({ business_id: businessId })
+    .select()
+    .single();
+
+  if (insertError) throw new Error(`getSessionByBusinessId (create): ${insertError.message}`);
+  return created;
+}
+
+async function updateSessionStatus(businessId, phoneNumber, connectionStatus) {
+  // First ensure session exists
+  await getSessionByBusinessId(businessId);
+
+  const fields = { connection_status: connectionStatus, updated_at: new Date().toISOString() };
+  if (phoneNumber) fields.phone_number = phoneNumber;
+  if (connectionStatus === 'connected') {
+    fields.last_connected_time = new Date().toISOString();
+  }
+
+  const { data, error } = await supabase
+    .from('whatsapp_sessions')
+    .update(fields)
+    .eq('business_id', businessId)
+    .select()
+    .single();
+
+  if (error) throw new Error(`updateSessionStatus: ${error.message}`);
+  return data;
+}
+
+// ══════════════════════════════════════════════════════════════
 //  CUSTOMER
 // ══════════════════════════════════════════════════════════════
 
-/**
- * Find or create a customer by WhatsApp phone number.
- * @param {string} phone  e.g. "+919876543210"
- * @param {string} [name] Display name from WhatsApp profile
- */
-async function upsertCustomer(phone, name = null) {
-  // Try to find existing
+async function upsertCustomer(businessId, phone, name = null) {
   const { data: existing } = await supabase
     .from('customers')
     .select('*')
+    .eq('business_id', businessId)
     .eq('phone', phone)
-    .single();
+    .maybeSingle();
 
   if (existing) {
-    // Update name if we now know it
     if (name && !existing.name) {
       await supabase.from('customers').update({ name }).eq('id', existing.id);
       existing.name = name;
@@ -55,17 +137,16 @@ async function upsertCustomer(phone, name = null) {
     return { customer: existing, isNew: false };
   }
 
-  // Create new customer + lead record
   const { data: customer, error } = await supabase
     .from('customers')
-    .insert({ phone, name })
+    .insert({ business_id: businessId, phone, name })
     .select()
     .single();
 
   if (error) throw new Error(`upsertCustomer: ${error.message}`);
 
-  // Create initial lead stage
   await supabase.from('leads').insert({
+    business_id: businessId,
     customer_id: customer.id,
     stage: 'new',
     source: 'whatsapp',
@@ -74,52 +155,63 @@ async function upsertCustomer(phone, name = null) {
   return { customer, isNew: true };
 }
 
-/**
- * Update customer profile fields.
- */
-async function updateCustomer(customerId, fields) {
-  const { error } = await supabase
+async function updateCustomer(businessId, customerId, fields) {
+  const { data, error } = await supabase
     .from('customers')
     .update(fields)
-    .eq('id', customerId);
+    .eq('business_id', businessId)
+    .eq('id', customerId)
+    .select()
+    .single();
   if (error) throw new Error(`updateCustomer: ${error.message}`);
+  return data;
 }
 
 // ══════════════════════════════════════════════════════════════
 //  LEAD PIPELINE
-// ══════════════════════════════════════════════════════════════
+// ──────────────────────────────────────────────────────────────
 
-/**
- * Move a customer's lead to a new stage.
- * @param {string} customerId
- * @param {'new'|'qualified'|'converted'|'lost'} stage
- */
-async function updateLeadStage(customerId, stage, interest = null) {
+async function updateLeadStage(businessId, customerId, stage, interest = null) {
   const update = { stage, last_activity: new Date().toISOString() };
   if (interest) update.interest = interest;
 
   const { error } = await supabase
     .from('leads')
     .update(update)
+    .eq('business_id', businessId)
     .eq('customer_id', customerId);
   if (error) throw new Error(`updateLeadStage: ${error.message}`);
 }
 
-async function getLeadByCustomer(customerId) {
+async function updateLeadById(businessId, leadId, fields) {
+  const { data, error } = await supabase
+    .from('leads')
+    .update(fields)
+    .eq('business_id', businessId)
+    .eq('id', leadId)
+    .select()
+    .single();
+  if (error) throw new Error(`updateLeadById: ${error.message}`);
+  return data;
+}
+
+async function getLeadByCustomer(businessId, customerId) {
   const { data } = await supabase
     .from('leads')
     .select('*')
+    .eq('business_id', businessId)
     .eq('customer_id', customerId)
-    .single();
+    .maybeSingle();
   return data;
 }
 
 // ══════════════════════════════════════════════════════════════
-//  MESSAGES (audit log)
-// ══════════════════════════════════════════════════════════════
+//  MESSAGES
+// ──────────────────────────────────────────────────────────────
 
-async function logMessage({ customerId, direction, content, intent, waMessageId, aiResponse }) {
+async function logMessage(businessId, { customerId, direction, content, intent, waMessageId, aiResponse }) {
   const { error } = await supabase.from('messages').insert({
+    business_id: businessId,
     customer_id: customerId,
     direction,
     content,
@@ -130,113 +222,128 @@ async function logMessage({ customerId, direction, content, intent, waMessageId,
   if (error) throw new Error(`logMessage: ${error.message}`);
 }
 
-/**
- * Fetch last N messages for a customer (for AI context).
- */
-async function getMessageHistory(customerId, limit = 10) {
+async function getMessageHistory(businessId, customerId, limit = 10) {
   const { data } = await supabase
     .from('messages')
     .select('direction, content, created_at')
+    .eq('business_id', businessId)
     .eq('customer_id', customerId)
     .order('created_at', { ascending: false })
     .limit(limit);
 
-  return (data || []).reverse(); // chronological order
+  return (data || []).reverse();
 }
 
 // ══════════════════════════════════════════════════════════════
 //  RESERVATIONS
-// ══════════════════════════════════════════════════════════════
+// ──────────────────────────────────────────────────────────────
 
-async function createReservation(customerId, details) {
+async function createReservation(businessId, customerId, details) {
   const { data, error } = await supabase
     .from('reservations')
-    .insert({ customer_id: customerId, ...details })
+    .insert({ business_id: businessId, customer_id: customerId, ...details })
     .select()
     .single();
   if (error) throw new Error(`createReservation: ${error.message}`);
 
-  // Schedule a reminder 2h before reservation
   if (data && details.reserved_date && details.reserved_time) {
     const dt = new Date(`${details.reserved_date}T${details.reserved_time}`);
     dt.setHours(dt.getHours() - 2);
-    await createReminder({
+
+    const biz = await getBusinessById(businessId);
+    const bizName = biz?.name || 'BusinessFlow AI';
+
+    await createReminder(businessId, {
       customerId,
       reservationId: data.id,
-      message: `Reminder: Your table is booked for ${details.reserved_time} today at ${process.env.RESTAURANT_NAME}. See you soon! 🍽️`,
+      message: `Reminder: Your table is booked for ${details.reserved_time} today at ${bizName}. See you soon! 🍽️`,
       scheduledAt: dt.toISOString(),
     });
   }
   return data;
 }
 
-async function updateReservation(reservationId, fields) {
+async function updateReservation(businessId, reservationId, fields) {
   const { error } = await supabase
     .from('reservations')
     .update(fields)
+    .eq('business_id', businessId)
     .eq('id', reservationId);
   if (error) throw new Error(`updateReservation: ${error.message}`);
 }
 
-async function getReservationsByCustomer(customerId) {
+async function getReservationsByCustomer(businessId, customerId) {
   const { data } = await supabase
     .from('reservations')
     .select('*')
+    .eq('business_id', businessId)
     .eq('customer_id', customerId)
     .order('reserved_date', { ascending: false });
   return data || [];
 }
 
+async function getAllReservations(businessId) {
+  const { data } = await supabase
+    .from('reservations')
+    .select('*, customers(phone, name)')
+    .eq('business_id', businessId)
+    .order('reserved_date', { ascending: true });
+  return data || [];
+}
+
 // ══════════════════════════════════════════════════════════════
 //  ORDERS
-// ══════════════════════════════════════════════════════════════
+// ──────────────────────────────────────────────────────────────
 
-async function createOrder(customerId, details) {
+async function createOrder(businessId, customerId, details) {
   const { data, error } = await supabase
     .from('orders')
-    .insert({ customer_id: customerId, ...details })
+    .insert({ business_id: businessId, customer_id: customerId, ...details })
     .select()
     .single();
   if (error) throw new Error(`createOrder: ${error.message}`);
   return data;
 }
 
-async function updateOrder(orderId, fields) {
+async function updateOrder(businessId, orderId, fields) {
   const { error } = await supabase
     .from('orders')
     .update(fields)
+    .eq('business_id', businessId)
     .eq('id', orderId);
   if (error) throw new Error(`updateOrder: ${error.message}`);
 }
 
 // ══════════════════════════════════════════════════════════════
-//  TICKETS (Escalations)
-// ══════════════════════════════════════════════════════════════
+//  TICKETS
+// ──────────────────────────────────────────────────────────────
 
-async function createTicket(customerId, { issue, category = 'general', priority = 'normal' }) {
+async function createTicket(businessId, customerId, { issue, category = 'general', priority = 'normal' }) {
   const { data, error } = await supabase
     .from('tickets')
-    .insert({ customer_id: customerId, issue, category, priority })
+    .insert({ business_id: businessId, customer_id: customerId, issue, category, priority })
     .select()
     .single();
   if (error) throw new Error(`createTicket: ${error.message}`);
   return data;
 }
 
-async function updateTicket(ticketId, fields) {
+async function updateTicket(businessId, ticketId, fields) {
   const { error } = await supabase
     .from('tickets')
     .update(fields)
+    .eq('business_id', businessId)
     .eq('id', ticketId);
   if (error) throw new Error(`updateTicket: ${error.message}`);
 }
 
 // ══════════════════════════════════════════════════════════════
 //  REMINDERS
-// ══════════════════════════════════════════════════════════════
+// ──────────────────────────────────────────────────────────────
 
-async function createReminder({ customerId, reservationId = null, message, scheduledAt }) {
+async function createReminder(businessId, { customerId, reservationId = null, message, scheduledAt }) {
   await supabase.from('reminders').insert({
+    business_id: businessId,
     customer_id: customerId,
     reservation_id: reservationId,
     message,
@@ -262,19 +369,21 @@ async function markReminderSent(reminderId) {
 
 // ══════════════════════════════════════════════════════════════
 //  DASHBOARD QUERIES
-// ══════════════════════════════════════════════════════════════
+// ──────────────────────────────────────────────────────────────
 
-async function getDashboardStats() {
+async function getDashboardStats(businessId) {
   const [customers, leads, reservations, tickets] = await Promise.all([
-    supabase.from('customers').select('id', { count: 'exact', head: true }),
-    supabase.from('leads').select('stage'),
-    supabase.from('reservations').select('status').eq('status', 'confirmed'),
-    supabase.from('tickets').select('status').eq('status', 'open'),
+    supabase.from('customers').select('id', { count: 'exact', head: true }).eq('business_id', businessId),
+    supabase.from('leads').select('stage').eq('business_id', businessId),
+    supabase.from('reservations').select('status').eq('business_id', businessId).eq('status', 'confirmed'),
+    supabase.from('tickets').select('status').eq('business_id', businessId).eq('status', 'open'),
   ]);
 
-  const stageCount = {};
+  const stageCount = { new: 0, qualified: 0, converted: 0, lost: 0 };
   (leads.data || []).forEach(l => {
-    stageCount[l.stage] = (stageCount[l.stage] || 0) + 1;
+    if (stageCount[l.stage] !== undefined) {
+      stageCount[l.stage]++;
+    }
   });
 
   return {
@@ -285,38 +394,140 @@ async function getDashboardStats() {
   };
 }
 
-async function getAllCustomersWithLeads() {
+async function getAllCustomersWithLeads(businessId) {
   const { data } = await supabase
     .from('customers')
     .select(`*, leads(stage, interest, last_activity)`)
+    .eq('business_id', businessId)
     .order('created_at', { ascending: false });
   return data || [];
 }
 
-async function getAllTickets() {
+async function getAllTickets(businessId) {
   const { data } = await supabase
     .from('tickets')
     .select(`*, customers(phone, name)`)
+    .eq('business_id', businessId)
     .order('created_at', { ascending: false });
   return data || [];
 }
 
-async function getAllLeads() {
+async function getAllLeads(businessId) {
   const { data } = await supabase
     .from('leads')
     .select(`*, customers(phone, name, visit_count)`)
+    .eq('business_id', businessId)
     .order('last_activity', { ascending: false });
   return data || [];
 }
 
+// ══════════════════════════════════════════════════════════════
+//  AUTO-REPLY RULES
+// ──────────────────────────────────────────────────────────────
+
+async function getAllAutoReplies(businessId) {
+  const { data, error } = await supabase
+    .from('auto_replies')
+    .select('*')
+    .eq('business_id', businessId)
+    .order('created_at', { ascending: true });
+  if (error) throw new Error(`getAllAutoReplies: ${error.message}`);
+  return data || [];
+}
+
+async function createAutoReply(businessId, { keyword, response, enabled = true, matchType = 'contains' }) {
+  const { data, error } = await supabase
+    .from('auto_replies')
+    .insert({
+      business_id: businessId,
+      keyword: keyword.trim().toLowerCase(),
+      response,
+      enabled,
+      matchType
+    })
+    .select()
+    .single();
+  if (error) throw new Error(`createAutoReply: ${error.message}`);
+  return data;
+}
+
+async function updateAutoReply(businessId, ruleId, fields) {
+  const update = { ...fields };
+  if (fields.keyword) update.keyword = fields.keyword.trim().toLowerCase();
+
+  const { data, error } = await supabase
+    .from('auto_replies')
+    .update(update)
+    .eq('business_id', businessId)
+    .eq('id', ruleId)
+    .select()
+    .single();
+  if (error) throw new Error(`updateAutoReply: ${error.message}`);
+  return data;
+}
+
+async function deleteAutoReply(businessId, ruleId) {
+  const { error } = await supabase
+    .from('auto_replies')
+    .delete()
+    .eq('business_id', businessId)
+    .eq('id', ruleId);
+  if (error) throw new Error(`deleteAutoReply: ${error.message}`);
+  return true;
+}
+
+async function matchAutoReply(businessId, text) {
+  const lower = text.toLowerCase().trim();
+  const rules = await getAllAutoReplies(businessId);
+  const enabled = rules.filter(r => r.enabled);
+
+  for (const rule of enabled) {
+    const kw = rule.keyword;
+    const matched =
+      rule.matchType === 'exact'      ? lower === kw :
+      rule.matchType === 'startsWith' ? lower.startsWith(kw) :
+                                        lower.includes(kw); // contains
+    if (matched) return rule.response;
+  }
+  return null;
+}
+
+// ══════════════════════════════════════════════════════════════
+//  CONTACT MODES
+// ──────────────────────────────────────────────────────────────
+
+async function getContactMode(businessId, phone) {
+  const { data } = await supabase
+    .from('customers')
+    .select('contact_mode')
+    .eq('business_id', businessId)
+    .eq('phone', phone)
+    .maybeSingle();
+  return data ? (data.contact_mode || 'ai') : 'ai';
+}
+
+async function setContactMode(businessId, phone, mode) {
+  if (!['ai', 'manual'].includes(mode)) throw new Error('Invalid mode');
+  const { error } = await supabase
+    .from('customers')
+    .update({ contact_mode: mode, updated_at: new Date().toISOString() })
+    .eq('business_id', businessId)
+    .eq('phone', phone);
+  if (error) throw new Error(`setContactMode: ${error.message}`);
+}
+
 module.exports = {
   supabase,
+  getAllBusinesses, getBusinessById, getBusinessByPhone, createBusiness, updateBusiness, deleteBusiness,
+  getSessionByBusinessId, updateSessionStatus,
   upsertCustomer, updateCustomer,
-  updateLeadStage, getLeadByCustomer,
+  updateLeadStage, updateLeadById, getLeadByCustomer,
   logMessage, getMessageHistory,
-  createReservation, updateReservation, getReservationsByCustomer,
+  createReservation, updateReservation, getReservationsByCustomer, getAllReservations,
   createOrder, updateOrder,
   createTicket, updateTicket,
   createReminder, getPendingReminders, markReminderSent,
   getDashboardStats, getAllCustomersWithLeads, getAllTickets, getAllLeads,
+  getAllAutoReplies, createAutoReply, updateAutoReply, deleteAutoReply, matchAutoReply,
+  getContactMode, setContactMode,
 };
