@@ -1,74 +1,81 @@
 require('dotenv').config();
 
-const useLocal = process.env.DB_MODE === 'local' || 
-                 !process.env.SUPABASE_URL || 
-                 process.env.SUPABASE_URL.includes('your-supabase-project') ||
-                 process.env.SUPABASE_URL.includes('placeholder');
+// Fallback to local JSON database unless explicitly configured for Postgres
+const useLocal = process.env.DB_MODE !== 'postgres';
 
 if (useLocal) {
   console.log('[Database] 💾 Running in local JSON database mode (db.json)');
   module.exports = {
     ...require('./localDb'),
-    supabase: {
-      from: (table) => ({
-        select: () => ({ eq: () => ({ order: () => ({ limit: () => Promise.resolve({ data: [] }) }) }) }),
-        update: (data) => ({ eq: () => Promise.resolve({ error: null, data }) }),
-        insert: (data) => ({ select: () => ({ single: () => Promise.resolve({ data }) }) })
-      })
-    }
+    supabase: null // No longer using Supabase client
   };
   return;
 }
 
-const { createClient } = require('@supabase/supabase-js');
+const { Pool } = require('pg');
 
-// ── Supabase client (service role — bypasses RLS) ─────────────
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY,
-  { auth: { persistSession: false } }
-);
+console.log('[Database] 🐘 Connecting directly to Railway PostgreSQL...');
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL.includes('localhost') ? false : { rejectUnauthorized: false }
+});
 
 // ══════════════════════════════════════════════════════════════
 //  BUSINESS MANAGEMENT
 // ══════════════════════════════════════════════════════════════
 
 async function getAllBusinesses() {
-  const { data, error } = await supabase.from('businesses').select('*').order('name', { ascending: true });
-  if (error) throw new Error(`getAllBusinesses: ${error.message}`);
-  return data || [];
+  const res = await pool.query('SELECT * FROM businesses ORDER BY name ASC');
+  return res.rows;
 }
 
 async function getBusinessById(businessId) {
-  const { data, error } = await supabase.from('businesses').select('*').eq('id', businessId).maybeSingle();
-  if (error) throw new Error(`getBusinessById: ${error.message}`);
-  return data;
+  const res = await pool.query('SELECT * FROM businesses WHERE id = $1', [businessId]);
+  return res.rows[0] || null;
 }
 
 async function getBusinessByPhone(phone) {
   const normalized = phone.replace(/^\+/, '').trim();
-  // Find matching business (exact match on wa_phone_number)
-  // We can select all and match in JS to handle leading '+' variations safely
-  const { data, error } = await supabase.from('businesses').select('*');
-  if (error) throw new Error(`getBusinessByPhone: ${error.message}`);
-  return (data || []).find(b => b.wa_phone_number.replace(/^\+/, '').trim() === normalized) || null;
+  const res = await pool.query('SELECT * FROM businesses');
+  return res.rows.find(b => b.wa_phone_number.replace(/^\+/, '').trim() === normalized) || null;
 }
 
 async function createBusiness(fields) {
-  const { data, error } = await supabase.from('businesses').insert(fields).select().single();
-  if (error) throw new Error(`createBusiness: ${error.message}`);
-  return data;
+  const res = await pool.query(
+    `INSERT INTO businesses (
+      name, wa_phone_number, workflow_name, ai_system_prompt, knowledge_base, 
+      working_hours, subscription_plan, status, crm_settings, memory_settings, 
+      payment_config, api_keys, feature_flags
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING *`,
+    [
+      fields.name, fields.wa_phone_number, fields.workflow_name || null, fields.ai_system_prompt || '',
+      fields.knowledge_base || '', fields.working_hours || {}, fields.subscription_plan || 'free',
+      fields.status || 'active', fields.crm_settings || {}, fields.memory_settings || {},
+      fields.payment_config || {}, fields.api_keys || {}, fields.feature_flags || {}
+    ]
+  );
+  return res.rows[0];
 }
 
 async function updateBusiness(businessId, fields) {
-  const { data, error } = await supabase.from('businesses').update(fields).eq('id', businessId).select().single();
-  if (error) throw new Error(`updateBusiness: ${error.message}`);
-  return data;
+  const setClauses = [];
+  const values = [];
+  let index = 1;
+  for (const [key, val] of Object.entries(fields)) {
+    if (key === 'id' || key === 'created_at' || key === 'updated_at') continue;
+    setClauses.push(`${key} = $${index}`);
+    values.push(val);
+    index++;
+  }
+  values.push(businessId);
+  const query = `UPDATE businesses SET ${setClauses.join(', ')}, updated_at = NOW() WHERE id = $${index} RETURNING *`;
+  const res = await pool.query(query, values);
+  return res.rows[0];
 }
 
 async function deleteBusiness(businessId) {
-  const { error } = await supabase.from('businesses').delete().eq('id', businessId);
-  if (error) throw new Error(`deleteBusiness: ${error.message}`);
+  await pool.query('DELETE FROM businesses WHERE id = $1', [businessId]);
   return true;
 }
 
@@ -77,44 +84,36 @@ async function deleteBusiness(businessId) {
 // ══════════════════════════════════════════════════════════════
 
 async function getSessionByBusinessId(businessId) {
-  const { data: existing, error: selectError } = await supabase
-    .from('whatsapp_sessions')
-    .select('*')
-    .eq('business_id', businessId)
-    .maybeSingle();
+  const selectRes = await pool.query('SELECT * FROM whatsapp_sessions WHERE business_id = $1', [businessId]);
+  if (selectRes.rows[0]) return selectRes.rows[0];
 
-  if (selectError) throw new Error(`getSessionByBusinessId: ${selectError.message}`);
-  if (existing) return existing;
-
-  const { data: created, error: insertError } = await supabase
-    .from('whatsapp_sessions')
-    .insert({ business_id: businessId })
-    .select()
-    .single();
-
-  if (insertError) throw new Error(`getSessionByBusinessId (create): ${insertError.message}`);
-  return created;
+  const insertRes = await pool.query(
+    'INSERT INTO whatsapp_sessions (business_id) VALUES ($1) RETURNING *',
+    [businessId]
+  );
+  return insertRes.rows[0];
 }
 
 async function updateSessionStatus(businessId, phoneNumber, connectionStatus) {
-  // First ensure session exists
   await getSessionByBusinessId(businessId);
 
-  const fields = { connection_status: connectionStatus, updated_at: new Date().toISOString() };
-  if (phoneNumber) fields.phone_number = phoneNumber;
-  if (connectionStatus === 'connected') {
-    fields.last_connected_time = new Date().toISOString();
+  let query = 'UPDATE whatsapp_sessions SET connection_status = $1, updated_at = NOW()';
+  const params = [connectionStatus];
+  let index = 2;
+
+  if (phoneNumber) {
+    query += `, phone_number = $${index}`;
+    params.push(phoneNumber);
+    index++;
   }
+  if (connectionStatus === 'connected') {
+    query += `, last_connected_time = NOW()`;
+  }
+  query += ` WHERE business_id = $${index} RETURNING *`;
+  params.push(businessId);
 
-  const { data, error } = await supabase
-    .from('whatsapp_sessions')
-    .update(fields)
-    .eq('business_id', businessId)
-    .select()
-    .single();
-
-  if (error) throw new Error(`updateSessionStatus: ${error.message}`);
-  return data;
+  const res = await pool.query(query, params);
+  return res.rows[0];
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -122,129 +121,137 @@ async function updateSessionStatus(businessId, phoneNumber, connectionStatus) {
 // ══════════════════════════════════════════════════════════════
 
 async function upsertCustomer(businessId, phone, name = null) {
-  const { data: existing } = await supabase
-    .from('customers')
-    .select('*')
-    .eq('business_id', businessId)
-    .eq('phone', phone)
-    .maybeSingle();
+  const selectRes = await pool.query(
+    'SELECT * FROM customers WHERE business_id = $1 AND phone = $2',
+    [businessId, phone]
+  );
 
-  if (existing) {
-    if (name && !existing.name) {
-      await supabase.from('customers').update({ name }).eq('id', existing.id);
-      existing.name = name;
+  let customer = selectRes.rows[0];
+  if (customer) {
+    if (name && !customer.name) {
+      const updateRes = await pool.query(
+        'UPDATE customers SET name = $1, updated_at = NOW() WHERE id = $2 RETURNING *',
+        [name, customer.id]
+      );
+      customer = updateRes.rows[0];
     }
-    return { customer: existing, isNew: false };
+    return { customer, isNew: false };
   }
 
-  const { data: customer, error } = await supabase
-    .from('customers')
-    .insert({ business_id: businessId, phone, name })
-    .select()
-    .single();
+  // Insert customer
+  const insertRes = await pool.query(
+    'INSERT INTO customers (business_id, phone, name) VALUES ($1, $2, $3) RETURNING *',
+    [businessId, phone, name]
+  );
+  customer = insertRes.rows[0];
 
-  if (error) throw new Error(`upsertCustomer: ${error.message}`);
-
-  await supabase.from('leads').insert({
-    business_id: businessId,
-    customer_id: customer.id,
-    stage: 'new',
-    source: 'whatsapp',
-  });
+  // Create initial lead
+  await pool.query(
+    'INSERT INTO leads (business_id, customer_id, stage, source) VALUES ($1, $2, $3, $4)',
+    [businessId, customer.id, 'new', 'whatsapp']
+  );
 
   return { customer, isNew: true };
 }
 
 async function updateCustomer(businessId, customerId, fields) {
-  const { data, error } = await supabase
-    .from('customers')
-    .update(fields)
-    .eq('business_id', businessId)
-    .eq('id', customerId)
-    .select()
-    .single();
-  if (error) throw new Error(`updateCustomer: ${error.message}`);
-  return data;
+  const setClauses = [];
+  const values = [];
+  let index = 1;
+  for (const [key, val] of Object.entries(fields)) {
+    if (key === 'id' || key === 'business_id' || key === 'created_at' || key === 'updated_at') continue;
+    setClauses.push(`${key} = $${index}`);
+    values.push(val);
+    index++;
+  }
+  values.push(businessId, customerId);
+  const query = `UPDATE customers SET ${setClauses.join(', ')}, updated_at = NOW() WHERE business_id = $${index} AND id = $${index + 1} RETURNING *`;
+  const res = await pool.query(query, values);
+  return res.rows[0];
 }
 
 // ══════════════════════════════════════════════════════════════
 //  LEAD PIPELINE
-// ──────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════
 
 async function updateLeadStage(businessId, customerId, stage, interest = null) {
-  const update = { stage, last_activity: new Date().toISOString() };
-  if (interest) update.interest = interest;
-
-  const { error } = await supabase
-    .from('leads')
-    .update(update)
-    .eq('business_id', businessId)
-    .eq('customer_id', customerId);
-  if (error) throw new Error(`updateLeadStage: ${error.message}`);
+  if (interest) {
+    await pool.query(
+      'UPDATE leads SET stage = $1, interest = $2, last_activity = NOW() WHERE business_id = $3 AND customer_id = $4',
+      [stage, interest, businessId, customerId]
+    );
+  } else {
+    await pool.query(
+      'UPDATE leads SET stage = $1, last_activity = NOW() WHERE business_id = $2 AND customer_id = $3',
+      [stage, businessId, customerId]
+    );
+  }
 }
 
 async function updateLeadById(businessId, leadId, fields) {
-  const { data, error } = await supabase
-    .from('leads')
-    .update(fields)
-    .eq('business_id', businessId)
-    .eq('id', leadId)
-    .select()
-    .single();
-  if (error) throw new Error(`updateLeadById: ${error.message}`);
-  return data;
+  const setClauses = [];
+  const values = [];
+  let index = 1;
+  for (const [key, val] of Object.entries(fields)) {
+    if (key === 'id' || key === 'business_id' || key === 'customer_id' || key === 'created_at') continue;
+    setClauses.push(`${key} = $${index}`);
+    values.push(val);
+    index++;
+  }
+  values.push(businessId, leadId);
+  const query = `UPDATE leads SET ${setClauses.join(', ')} WHERE business_id = $${index} AND id = $${index + 1} RETURNING *`;
+  const res = await pool.query(query, values);
+  return res.rows[0];
 }
 
 async function getLeadByCustomer(businessId, customerId) {
-  const { data } = await supabase
-    .from('leads')
-    .select('*')
-    .eq('business_id', businessId)
-    .eq('customer_id', customerId)
-    .maybeSingle();
-  return data;
+  const res = await pool.query(
+    'SELECT * FROM leads WHERE business_id = $1 AND customer_id = $2',
+    [businessId, customerId]
+  );
+  return res.rows[0] || null;
 }
 
 // ══════════════════════════════════════════════════════════════
 //  MESSAGES
-// ──────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════
 
 async function logMessage(businessId, { customerId, direction, content, intent, waMessageId, aiResponse }) {
-  const { error } = await supabase.from('messages').insert({
-    business_id: businessId,
-    customer_id: customerId,
-    direction,
-    content,
-    intent: intent || null,
-    wa_message_id: waMessageId || null,
-    ai_response: aiResponse || null,
-  });
-  if (error) throw new Error(`logMessage: ${error.message}`);
+  await pool.query(
+    `INSERT INTO messages (business_id, customer_id, direction, content, intent, wa_message_id, ai_response) 
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [businessId, customerId, direction, content, intent || null, waMessageId || null, aiResponse ? JSON.stringify(aiResponse) : null]
+  );
 }
 
 async function getMessageHistory(businessId, customerId, limit = 10) {
-  const { data } = await supabase
-    .from('messages')
-    .select('direction, content, created_at')
-    .eq('business_id', businessId)
-    .eq('customer_id', customerId)
-    .order('created_at', { ascending: false })
-    .limit(limit);
-
-  return (data || []).reverse();
+  const res = await pool.query(
+    `SELECT direction, content, created_at FROM messages 
+     WHERE business_id = $1 AND customer_id = $2 
+     ORDER BY created_at DESC LIMIT $3`,
+    [businessId, customerId, limit]
+  );
+  return res.rows.reverse();
 }
 
 // ══════════════════════════════════════════════════════════════
 //  RESERVATIONS
-// ──────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════
 
 async function createReservation(businessId, customerId, details) {
-  const { data, error } = await supabase
-    .from('reservations')
-    .insert({ business_id: businessId, customer_id: customerId, ...details })
-    .select()
-    .single();
-  if (error) throw new Error(`createReservation: ${error.message}`);
+  const res = await pool.query(
+    `INSERT INTO reservations (
+      business_id, customer_id, party_size, reserved_date, reserved_time, 
+      table_number, occasion, special_notes, status
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
+    [
+      businessId, customerId, details.party_size || 1, 
+      details.reserved_date || new Date().toISOString().split('T')[0],
+      details.reserved_time || '19:00:00', details.table_number || null,
+      details.occasion || null, details.special_notes || null, details.status || 'pending'
+    ]
+  );
+  const data = res.rows[0];
 
   if (data && details.reserved_date && details.reserved_time) {
     const dt = new Date(`${details.reserved_date}T${details.reserved_time}`);
@@ -264,215 +271,249 @@ async function createReservation(businessId, customerId, details) {
 }
 
 async function updateReservation(businessId, reservationId, fields) {
-  const { error } = await supabase
-    .from('reservations')
-    .update(fields)
-    .eq('business_id', businessId)
-    .eq('id', reservationId);
-  if (error) throw new Error(`updateReservation: ${error.message}`);
+  const setClauses = [];
+  const values = [];
+  let index = 1;
+  for (const [key, val] of Object.entries(fields)) {
+    if (key === 'id' || key === 'business_id' || key === 'customer_id' || key === 'created_at' || key === 'updated_at') continue;
+    setClauses.push(`${key} = $${index}`);
+    values.push(val);
+    index++;
+  }
+  values.push(businessId, reservationId);
+  await pool.query(
+    `UPDATE reservations SET ${setClauses.join(', ')}, updated_at = NOW() 
+     WHERE business_id = $${index} AND id = $${index + 1}`,
+    values
+  );
 }
 
 async function getReservationsByCustomer(businessId, customerId) {
-  const { data } = await supabase
-    .from('reservations')
-    .select('*')
-    .eq('business_id', businessId)
-    .eq('customer_id', customerId)
-    .order('reserved_date', { ascending: false });
-  return data || [];
+  const res = await pool.query(
+    'SELECT * FROM reservations WHERE business_id = $1 AND customer_id = $2 ORDER BY reserved_date DESC',
+    [businessId, customerId]
+  );
+  return res.rows;
 }
 
 async function getAllReservations(businessId) {
-  const { data } = await supabase
-    .from('reservations')
-    .select('*, customers(phone, name)')
-    .eq('business_id', businessId)
-    .order('reserved_date', { ascending: true });
-  return data || [];
+  const res = await pool.query(
+    `SELECT r.*, row_to_json(c) as customers 
+     FROM reservations r
+     LEFT JOIN customers c ON r.customer_id = c.id
+     WHERE r.business_id = $1
+     ORDER BY r.reserved_date ASC`,
+    [businessId]
+  );
+  return res.rows;
 }
 
 // ══════════════════════════════════════════════════════════════
 //  ORDERS
-// ──────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════
 
 async function createOrder(businessId, customerId, details) {
-  const { data, error } = await supabase
-    .from('orders')
-    .insert({ business_id: businessId, customer_id: customerId, ...details })
-    .select()
-    .single();
-  if (error) throw new Error(`createOrder: ${error.message}`);
-  return data;
+  const res = await pool.query(
+    `INSERT INTO orders (
+      business_id, customer_id, order_type, items, total_amount, 
+      status, payment_status, payment_link, delivery_addr, lead_stage, metadata
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
+    [
+      businessId, customerId, details.order_type || 'dine-in',
+      details.items ? JSON.stringify(details.items) : null,
+      details.total_amount || 0, details.status || 'received',
+      details.payment_status || 'pending', details.payment_link || null,
+      details.delivery_addr || null, details.lead_stage || 'qualified',
+      details.metadata ? JSON.stringify(details.metadata) : null
+    ]
+  );
+  return res.rows[0];
 }
 
 async function updateOrder(businessId, orderId, fields) {
-  const { error } = await supabase
-    .from('orders')
-    .update(fields)
-    .eq('business_id', businessId)
-    .eq('id', orderId);
-  if (error) throw new Error(`updateOrder: ${error.message}`);
+  const setClauses = [];
+  const values = [];
+  let index = 1;
+  for (const [key, val] of Object.entries(fields)) {
+    if (key === 'id' || key === 'business_id' || key === 'customer_id' || key === 'created_at' || key === 'updated_at') continue;
+    setClauses.push(`${key} = $${index}`);
+    values.push(key === 'items' || key === 'metadata' ? JSON.stringify(val) : val);
+    index++;
+  }
+  values.push(businessId, orderId);
+  await pool.query(
+    `UPDATE orders SET ${setClauses.join(', ')}, updated_at = NOW() 
+     WHERE business_id = $${index} AND id = $${index + 1}`,
+    values
+  );
 }
 
 // ══════════════════════════════════════════════════════════════
 //  TICKETS
-// ──────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════
 
 async function createTicket(businessId, customerId, { issue, category = 'general', priority = 'normal' }) {
-  const { data, error } = await supabase
-    .from('tickets')
-    .insert({ business_id: businessId, customer_id: customerId, issue, category, priority })
-    .select()
-    .single();
-  if (error) throw new Error(`createTicket: ${error.message}`);
-  return data;
+  const res = await pool.query(
+    `INSERT INTO tickets (business_id, customer_id, issue, category, priority) 
+     VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+    [businessId, customerId, issue, category, priority]
+  );
+  return res.rows[0];
 }
 
 async function updateTicket(businessId, ticketId, fields) {
-  const { error } = await supabase
-    .from('tickets')
-    .update(fields)
-    .eq('business_id', businessId)
-    .eq('id', ticketId);
-  if (error) throw new Error(`updateTicket: ${error.message}`);
+  const setClauses = [];
+  const values = [];
+  let index = 1;
+  for (const [key, val] of Object.entries(fields)) {
+    if (key === 'id' || key === 'business_id' || key === 'customer_id' || key === 'created_at' || key === 'updated_at') continue;
+    setClauses.push(`${key} = $${index}`);
+    values.push(val);
+    index++;
+  }
+  values.push(businessId, ticketId);
+  await pool.query(
+    `UPDATE tickets SET ${setClauses.join(', ')}, updated_at = NOW() 
+     WHERE business_id = $${index} AND id = $${index + 1}`,
+    values
+  );
 }
 
 // ══════════════════════════════════════════════════════════════
 //  REMINDERS
-// ──────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════
 
 async function createReminder(businessId, { customerId, reservationId = null, message, scheduledAt }) {
-  await supabase.from('reminders').insert({
-    business_id: businessId,
-    customer_id: customerId,
-    reservation_id: reservationId,
-    message,
-    scheduled_at: scheduledAt,
-  });
+  await pool.query(
+    `INSERT INTO reminders (business_id, customer_id, reservation_id, message, scheduled_at) 
+     VALUES ($1, $2, $3, $4, $5)`,
+    [businessId, customerId, reservationId, message, scheduledAt]
+  );
 }
 
 async function getPendingReminders() {
-  const { data } = await supabase
-    .from('reminders')
-    .select('*, customers(phone, name)')
-    .eq('sent', false)
-    .lte('scheduled_at', new Date().toISOString());
-  return data || [];
+  const res = await pool.query(
+    `SELECT r.*, row_to_json(c) as customers 
+     FROM reminders r
+     LEFT JOIN customers c ON r.customer_id = c.id
+     WHERE r.sent = false AND r.scheduled_at <= NOW()`
+  );
+  return res.rows;
 }
 
 async function markReminderSent(reminderId) {
-  await supabase
-    .from('reminders')
-    .update({ sent: true, sent_at: new Date().toISOString() })
-    .eq('id', reminderId);
+  await pool.query(
+    'UPDATE reminders SET sent = true, sent_at = NOW() WHERE id = $1',
+    [reminderId]
+  );
 }
 
 // ══════════════════════════════════════════════════════════════
 //  DASHBOARD QUERIES
-// ──────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════
 
 async function getDashboardStats(businessId) {
-  const [customers, leads, reservations, tickets] = await Promise.all([
-    supabase.from('customers').select('id', { count: 'exact', head: true }).eq('business_id', businessId),
-    supabase.from('leads').select('stage').eq('business_id', businessId),
-    supabase.from('reservations').select('status').eq('business_id', businessId).eq('status', 'confirmed'),
-    supabase.from('tickets').select('status').eq('business_id', businessId).eq('status', 'open'),
-  ]);
+  const customersRes = await pool.query('SELECT COUNT(*) FROM customers WHERE business_id = $1', [businessId]);
+  const leadsRes = await pool.query('SELECT stage FROM leads WHERE business_id = $1', [businessId]);
+  const reservationsRes = await pool.query("SELECT COUNT(*) FROM reservations WHERE business_id = $1 AND status = 'confirmed'", [businessId]);
+  const ticketsRes = await pool.query("SELECT COUNT(*) FROM tickets WHERE business_id = $1 AND status IN ('open', 'escalated')", [businessId]);
 
   const stageCount = { new: 0, qualified: 0, converted: 0, lost: 0 };
-  (leads.data || []).forEach(l => {
+  leadsRes.rows.forEach(l => {
     if (stageCount[l.stage] !== undefined) {
       stageCount[l.stage]++;
     }
   });
 
   return {
-    totalCustomers: customers.count || 0,
+    totalCustomers: parseInt(customersRes.rows[0].count) || 0,
     pipeline: stageCount,
-    confirmedReservations: reservations.data?.length || 0,
-    openTickets: tickets.data?.length || 0,
+    confirmedReservations: parseInt(reservationsRes.rows[0].count) || 0,
+    openTickets: parseInt(ticketsRes.rows[0].count) || 0,
   };
 }
 
 async function getAllCustomersWithLeads(businessId) {
-  const { data } = await supabase
-    .from('customers')
-    .select(`*, leads(stage, interest, last_activity)`)
-    .eq('business_id', businessId)
-    .order('created_at', { ascending: false });
-  return data || [];
+  const res = await pool.query(
+    `SELECT c.*, row_to_json(l) as leads 
+     FROM customers c
+     LEFT JOIN leads l ON l.customer_id = c.id
+     WHERE c.business_id = $1
+     ORDER BY c.created_at DESC`,
+    [businessId]
+  );
+  return res.rows;
 }
 
 async function getAllTickets(businessId) {
-  const { data } = await supabase
-    .from('tickets')
-    .select(`*, customers(phone, name)`)
-    .eq('business_id', businessId)
-    .order('created_at', { ascending: false });
-  return data || [];
+  const res = await pool.query(
+    `SELECT t.*, row_to_json(c) as customers 
+     FROM tickets t
+     LEFT JOIN customers c ON t.customer_id = c.id
+     WHERE t.business_id = $1
+     ORDER BY t.created_at DESC`,
+    [businessId]
+  );
+  return res.rows;
 }
 
 async function getAllLeads(businessId) {
-  const { data } = await supabase
-    .from('leads')
-    .select(`*, customers(phone, name, visit_count)`)
-    .eq('business_id', businessId)
-    .order('last_activity', { ascending: false });
-  return data || [];
+  const res = await pool.query(
+    `SELECT l.*, row_to_json(c) as customers 
+     FROM leads l
+     LEFT JOIN customers c ON l.customer_id = c.id
+     WHERE l.business_id = $1
+     ORDER BY l.last_activity DESC`,
+    [businessId]
+  );
+  return res.rows;
 }
 
 // ══════════════════════════════════════════════════════════════
 //  AUTO-REPLY RULES
-// ──────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════
 
 async function getAllAutoReplies(businessId) {
-  const { data, error } = await supabase
-    .from('auto_replies')
-    .select('*')
-    .eq('business_id', businessId)
-    .order('created_at', { ascending: true });
-  if (error) throw new Error(`getAllAutoReplies: ${error.message}`);
-  return data || [];
+  const res = await pool.query(
+    'SELECT * FROM auto_replies WHERE business_id = $1 ORDER BY created_at ASC',
+    [businessId]
+  );
+  return res.rows;
 }
 
 async function createAutoReply(businessId, { keyword, response, enabled = true, matchType = 'contains' }) {
-  const { data, error } = await supabase
-    .from('auto_replies')
-    .insert({
-      business_id: businessId,
-      keyword: keyword.trim().toLowerCase(),
-      response,
-      enabled,
-      matchType
-    })
-    .select()
-    .single();
-  if (error) throw new Error(`createAutoReply: ${error.message}`);
-  return data;
+  const res = await pool.query(
+    `INSERT INTO auto_replies (business_id, keyword, response, enabled, match_type) 
+     VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+    [businessId, keyword.trim().toLowerCase(), response, enabled, matchType]
+  );
+  return res.rows[0];
 }
 
 async function updateAutoReply(businessId, ruleId, fields) {
-  const update = { ...fields };
-  if (fields.keyword) update.keyword = fields.keyword.trim().toLowerCase();
-
-  const { data, error } = await supabase
-    .from('auto_replies')
-    .update(update)
-    .eq('business_id', businessId)
-    .eq('id', ruleId)
-    .select()
-    .single();
-  if (error) throw new Error(`updateAutoReply: ${error.message}`);
-  return data;
+  const setClauses = [];
+  const values = [];
+  let index = 1;
+  for (const [key, val] of Object.entries(fields)) {
+    if (key === 'id' || key === 'business_id' || key === 'created_at') continue;
+    setClauses.push(`${key} = $${index}`);
+    values.push(key === 'keyword' ? val.trim().toLowerCase() : val);
+    index++;
+  }
+  values.push(businessId, ruleId);
+  const res = await pool.query(
+    `UPDATE auto_replies SET ${setClauses.join(', ')}, updated_at = NOW() 
+     WHERE business_id = $${index} AND id = $${index + 1} RETURNING *`,
+    values
+  );
+  return res.rows[0];
 }
 
 async function deleteAutoReply(businessId, ruleId) {
-  const { error } = await supabase
-    .from('auto_replies')
-    .delete()
-    .eq('business_id', businessId)
-    .eq('id', ruleId);
-  if (error) throw new Error(`deleteAutoReply: ${error.message}`);
+  await pool.query(
+    'DELETE FROM auto_replies WHERE business_id = $1 AND id = $2',
+    [businessId, ruleId]
+  );
   return true;
 }
 
@@ -494,30 +535,25 @@ async function matchAutoReply(businessId, text) {
 
 // ══════════════════════════════════════════════════════════════
 //  CONTACT MODES
-// ──────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════
 
 async function getContactMode(businessId, phone) {
-  const { data } = await supabase
-    .from('customers')
-    .select('contact_mode')
-    .eq('business_id', businessId)
-    .eq('phone', phone)
-    .maybeSingle();
-  return data ? (data.contact_mode || 'ai') : 'ai';
+  const res = await pool.query(
+    'SELECT contact_mode FROM customers WHERE business_id = $1 AND phone = $2',
+    [businessId, phone]
+  );
+  return res.rows[0] ? (res.rows[0].contact_mode || 'ai') : 'ai';
 }
 
 async function setContactMode(businessId, phone, mode) {
-  if (!['ai', 'manual'].includes(mode)) throw new Error('Invalid mode');
-  const { error } = await supabase
-    .from('customers')
-    .update({ contact_mode: mode, updated_at: new Date().toISOString() })
-    .eq('business_id', businessId)
-    .eq('phone', phone);
-  if (error) throw new Error(`setContactMode: ${error.message}`);
+  await pool.query(
+    'UPDATE customers SET contact_mode = $1, updated_at = NOW() WHERE business_id = $2 AND phone = $3',
+    [mode, businessId, phone]
+  );
 }
 
 module.exports = {
-  supabase,
+  supabase: null,
   getAllBusinesses, getBusinessById, getBusinessByPhone, createBusiness, updateBusiness, deleteBusiness,
   getSessionByBusinessId, updateSessionStatus,
   upsertCustomer, updateCustomer,
