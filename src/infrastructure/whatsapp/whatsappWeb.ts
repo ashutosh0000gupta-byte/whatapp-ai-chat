@@ -85,7 +85,7 @@ export async function connectSession(businessId: string): Promise<void> {
   const existing = sessions.get(businessId);
   if (existing && existing.sock) {
     try {
-      existing.sock.ev.removeAllListeners();
+      (existing.sock.ev as any).removeAllListeners();
     } catch (_) {}
   }
 
